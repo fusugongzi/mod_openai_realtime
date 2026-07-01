@@ -375,12 +375,16 @@ class AudioStreamer {
                               "(%s) processMessage - user speech stopped\n", m_sessionId.c_str());
             // Do not clear playback_clear_requested here; it should remain true until new audio is received.
 
-        } else if (jsType && strcmp(jsType, "response.output_audio.delta") == 0) {
+        } else if (jsType && (strcmp(jsType, "response.output_audio.delta") == 0 ||
+                              strcmp(jsType, "response.audio.delta") == 0)) {
             const char *jsonAudio = cJSON_GetObjectCstr(json, "delta");
             playback_clear_requested = false;
             m_response_audio_done = false;
 
             if (jsonAudio && strlen(jsonAudio) > 0) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                                  "(%s) realtime audio delta received: delta_chars=%zu, type=%s\n",
+                                  m_sessionId.c_str(), strlen(jsonAudio), jsType);
                 std::string rawAudio;
                 try {
                     rawAudio = base64_decode(jsonAudio);
@@ -390,6 +394,9 @@ class AudioStreamer {
                     cJSON_Delete(json);
                     return status;
                 }
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                                  "(%s) realtime audio delta decoded: raw=%zu bytes, playback_rate=%d, session_rate=%d, type=%s\n",
+                                  m_sessionId.c_str(), rawAudio.size(), in_sample_rate, out_sample_rate, jsType);
 
                 if (!m_disable_audiofiles) {
                     std::string filePath = saveDebugAudioFile(rawAudio);
@@ -405,15 +412,23 @@ class AudioStreamer {
                 auto resampled = convertRawAudio(rawAudio);
                 if (!resampled.empty()) {
                     push_audio_queue(resampled);
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                                      "(%s) queued realtime audio delta: raw=%zu bytes, samples=%zu, type=%s\n",
+                                      m_sessionId.c_str(), rawAudio.size(), resampled.size(), jsType);
                     status = SWITCH_TRUE;
+                } else {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                      "(%s) realtime audio delta converted to empty audio: raw=%zu bytes, type=%s\n",
+                                      m_sessionId.c_str(), rawAudio.size(), jsType);
                 }
 
             } else {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                  "(%s) processMessage - response.output_audio.delta no audio data\n",
-                                  m_sessionId.c_str());
+                                  "(%s) processMessage - realtime audio delta has no audio data, type=%s\n",
+                                  m_sessionId.c_str(), jsType);
             }
-        } else if (jsType && strcmp(jsType, "response.output_audio.done") == 0) {
+        } else if (jsType && (strcmp(jsType, "response.output_audio.done") == 0 ||
+                              strcmp(jsType, "response.audio.done") == 0)) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                               "(%s) processMessage - audio done\n", m_sessionId.c_str());
             m_response_audio_done = true;
@@ -1227,7 +1242,11 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
         std::vector<int16_t> chunk;
         if (as->pop_audio_queue(chunk)) {
             switch_buffer_write(tech_pvt->playback_buffer, chunk.data(), chunk.size() * sizeof(int16_t));
+            inuse = switch_buffer_inuse(tech_pvt->playback_buffer);
             chunk_enqueued = true;
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                              "%s: queued playback chunk: samples=%zu, playback_buffer=%u bytes\n",
+                              tech_pvt->sessionId, chunk.size(), inuse);
         }
     }
     if (!chunk_enqueued && inuse == 0) {
@@ -1257,6 +1276,9 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
         frame->samples = frame->datalen / bytes_per_sample;
 
         switch_core_media_bug_set_write_replace_frame(bug, frame);
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                          "%s: wrote playback frame: bytes=%u, samples=%u\n", tech_pvt->sessionId,
+                          frame->datalen, frame->samples);
     }
 
     return SWITCH_TRUE;
