@@ -59,6 +59,12 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 sudo make install
 ```
+`make` builds the shared library in the build directory. `make install` copies it to the running FreeSWITCH module directory; check this directory with `fs_cli -x 'global_getvar mod_dir'`. After installation, run `fs_cli -x 'reload mod_openai_audio_stream'` while no streams are active and check that the reload succeeds. Configuration changes in the Go caller require restarting that caller as well.
+
+Stream startup confirms the applied policy in its API reply: `+OK Success allow_interrupt=false` when interruptions are disabled. An older module returning only `+OK Success` cannot confirm this setting. The module also logs `Realtime stream config: STREAM_ALLOW_INTERRUPT=false, allow_interrupt=false` when a stream starts.
+
+GNU builds use `-fno-gnu-unique` for both the module and IXWebSocket so `dlclose` can unload the shared library during reload. A process that already loaded an older build with GNU `UNIQUE` symbols may still need one FreeSWITCH restart to release that build. If `/proc/<freeswitch-pid>/maps` shows the module as `(deleted)` and its inode differs from `stat` on the installed `.so`, the process is still mapping a replaced file. Verify that the active module maps the installed inode after the restart.
+
 **TLS** is `OFF` by default. To build with TLS support add `-DUSE_TLS=ON` to cmake line.
 
 ### Getting started
@@ -102,6 +108,7 @@ The following channel variables can be used to fine-tune websocket connection an
 | STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20        | 20      |
 | STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format     | none    |
 | STREAM_NO_RECONNECT                    | true or 1, disables automatic websocket reconnection    | off     |
+| STREAM_ALLOW_INTERRUPT                 | false or 0, prevents caller speech from interrupting AI playback | true |
 | STREAM_TLS_CA_FILE                     | CA cert or bundle, or the special values SYSTEM or NONE | SYSTEM  |
 | STREAM_TLS_KEY_FILE                    | optional client key for WSS connections                 | none    |
 | STREAM_TLS_CERT_FILE                   | optional client cert for WSS connections                | none    |
@@ -125,6 +132,7 @@ you would set this variable to 100. If ommited, default packet size of 20ms will
       "Header3": "Value3"
   }
 - Websocket automatic reconnection is on by default. To disable it set this channel variable to true or 1.
+- Set `STREAM_ALLOW_INTERRUPT=false` before starting a stream to disable user interruptions. Caller audio received while AI audio is queued or playing is buffered and forwarded in order after the response audio has completed and both playback buffers have drained. User speech is preserved, and VAD `input_audio_buffer.speech_started` events no longer clear playback in this mode. This applies to both JSON and raw audio streams. For OpenAI/Azure, also set `turn_detection.interrupt_response=false` in `session.update` to disable server-side cancellation (under `audio.input.turn_detection` for the GA schema).
 - TLS (for WSS) options can be fine tuned with the `STREAM_TLS_*` channel variables:
   - `STREAM_TLS_CA_FILE` the ca certificate (or certificate bundle) file. By default is `SYSTEM` which means use the system defaults.
 Can be `NONE` which result in no peer verification.
@@ -155,7 +163,7 @@ Because text frames continue to be processed through the normal `processMessage(
 
 | Feature | Required text event from backend | Effect |
 | --- | --- | --- |
-| Barge-in (user interrupts playback) | `{"type":"input_audio_buffer.speech_started"}` | Clears audio queue and playback buffer |
+| Barge-in (user interrupts playback) | `{"type":"input_audio_buffer.speech_started"}` | Clears audio queue and playback buffer when `STREAM_ALLOW_INTERRUPT=true` (default) |
 | User speech stopped | `{"type":"input_audio_buffer.speech_stopped"}` | Logged; playback remains cleared until new audio arrives |
 | Audio response complete | `{"type":"response.output_audio.done"}` | Sets response done flag and allows `openai_speech_stop` to fire after playback drains |
 | Error reporting | Any JSON with `"type"` containing `"error"` | Logged as error |
@@ -270,7 +278,7 @@ Module will generate the following event types:
 
 In raw audio mode, control messages from the backend, such as `input_audio_buffer.speech_started` and `input_audio_buffer.speech_stopped`, are still received as JSON text frames and handled through the normal message-processing path. They are not emitted as dedicated FreeSWITCH events by the module. Instead:
 
-- `input_audio_buffer.speech_started` is used internally for barge-in, clearing queued playback audio. This typically corresponds to VAD being triggered by the backend.
+- `input_audio_buffer.speech_started` is used internally for barge-in, clearing queued playback audio when `STREAM_ALLOW_INTERRUPT=true` (default). With `STREAM_ALLOW_INTERRUPT=false`, playback continues and caller audio is buffered for processing after AI playback finishes. This typically corresponds to VAD being triggered by the backend.
 - `input_audio_buffer.speech_stopped` is logged and forwarded through the normal JSON event flow.
 - `mod_openai_audio_stream::openai_speech_start` is emitted by the module when playback actually starts.
 - `mod_openai_audio_stream::openai_speech_stop` is emitted by the module when playback has fully drained after `response.output_audio.done`.
@@ -354,3 +362,12 @@ Can be useful for debugging purposes or other use cases. The `STREAM_DISABLE_AUD
 If printing to the log is not suppressed, `response` printed to the console will look the same as the event. The original response containing base64 encoded audio is replaced because it can be quite huge.
 
 the files generated by this feature will reside at the temp directory and will be deleted when the session is closed.
+
+## Interruption policy tests
+
+The caller-audio buffering tests can run without FreeSWITCH development headers:
+
+```sh
+c++ -std=c++11 -Wall -Wextra -Werror -pthread -I. tests/audio_interruption_policy_test.cpp -o /tmp/audio_interruption_policy_test
+/tmp/audio_interruption_policy_test
+```

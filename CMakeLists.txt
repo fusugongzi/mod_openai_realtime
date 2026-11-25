@@ -27,6 +27,12 @@ message(STATUS "FreeSWITCH modules dir: ${FS_MOD_DIR}")
 
 set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "Disable ixwebsocket installation" FORCE)
 set(USE_TLS ON CACHE BOOL "Use TLS for secure WebSocket connections" FORCE)
+# GNU-unique C++ symbols pin a DSO in memory after dlclose, so FreeSWITCH reload
+# can keep using an old module even after make install replaces the file.
+# Apply to IXWebSocket too, since its static archive is linked into the module.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-fno-gnu-unique>")
+endif()
 add_subdirectory(libs/IXWebSocket)
 
 if(CMAKE_BUILD_TYPE MATCHES "Release")
@@ -40,6 +46,7 @@ add_library(mod_openai_audio_stream SHARED
     openai_audio_streamer_glue.h
     openai_audio_streamer_glue.cpp
     base64.cpp
+    audio_interruption_policy.h
 )
 
 set_property(TARGET mod_openai_audio_stream PROPERTY POSITION_INDEPENDENT_CODE ON)

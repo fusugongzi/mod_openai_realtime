@@ -8,6 +8,7 @@
 #include <cctype>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -17,6 +18,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "base64.h"
+#include "audio_interruption_policy.h"
 
 #define FRAME_SIZE_8000 320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
 #define MAX_AUDIO_CHUNK_SAMPLES                                                                                        \
@@ -40,9 +42,11 @@ class AudioStreamer {
     AudioStreamer(const char *uuid, const char *wsUri, responseHandler_t callback, int deflate, int heart_beat,
                   bool suppressLog, const char *extra_headers, bool no_reconnect, const char *tls_cafile,
                   const char *tls_keyfile, const char *tls_certfile, bool tls_disable_hostname_validation,
-                  uint32_t session_sampling, uint32_t playback_sampling, bool disable_audiofiles, bool raw_audio_mode)
+                  uint32_t session_sampling, uint32_t playback_sampling, bool disable_audiofiles, bool raw_audio_mode,
+                  bool allow_interrupt)
         : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog), m_extra_headers(extra_headers),
-          m_playFile(0), m_disable_audiofiles(disable_audiofiles), m_raw_audio_mode(raw_audio_mode) {
+          m_playFile(0), m_disable_audiofiles(disable_audiofiles), m_raw_audio_mode(raw_audio_mode),
+          m_interruption_policy(allow_interrupt) {
 
         in_sample_rate = playback_sampling;
 
@@ -363,12 +367,14 @@ class AudioStreamer {
                               "(%s) processMessage - error: %s\n", m_sessionId.c_str(), message.c_str());
 
         } else if (jsType && strcmp(jsType, "input_audio_buffer.speech_started") == 0) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                              "(%s) processMessage - user speech started, stopping openai audio playback\n",
-                              m_sessionId.c_str());
-            clear_audio_queue();
-            // also clear the private_t playback buffer used in write frame
-            playback_clear_requested = true;
+            if (m_interruption_policy.allows_interrupt()) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                                  "(%s) processMessage - user speech started, stopping openai audio playback\n",
+                                  m_sessionId.c_str());
+                clear_audio_queue();
+                // also clear the private_t playback buffer used in write frame
+                playback_clear_requested = true;
+            }
 
         } else if (jsType && strcmp(jsType, "input_audio_buffer.speech_stopped") == 0) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
@@ -428,7 +434,7 @@ class AudioStreamer {
                                   m_sessionId.c_str(), jsType);
             }
         } else if (jsType && (strcmp(jsType, "response.output_audio.done") == 0 ||
-                              strcmp(jsType, "response.audio.done") == 0)) {
+                              strcmp(jsType, "response.audio.done") == 0 || strcmp(jsType, "response.done") == 0)) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                               "(%s) processMessage - audio done\n", m_sessionId.c_str());
             m_response_audio_done = true;
@@ -441,6 +447,7 @@ class AudioStreamer {
 
     void push_audio_queue(const std::vector<int16_t>& audio_data) {
         std::lock_guard<std::mutex> lock(m_audio_queue_mutex);
+        m_interruption_policy.playback_started();
         const size_t total = audio_data.size();
         if (total <= MAX_AUDIO_CHUNK_SAMPLES) {
             m_audio_queue.push(audio_data);
@@ -516,6 +523,14 @@ class AudioStreamer {
     }
 
     void sendAudio(uint8_t *buffer, size_t len) {
+        // Preserve caller speech during AI playback, then forward it in order once
+        // playback drains. Do not let server VAD cancel audio still being played.
+        m_interruption_policy.send_user_audio(buffer, len, [this](uint8_t *audio, size_t size) {
+            sendAudioFrame(audio, size);
+        });
+    }
+
+    void sendAudioFrame(uint8_t *buffer, size_t len) {
         if (m_raw_audio_mode) {
             writeBinary(buffer, len);
         } else {
@@ -541,12 +556,19 @@ class AudioStreamer {
         return playback_clear_requested;
     }
 
-    bool is_openai_speaking() {
-        return m_openai_speaking;
+    // Called only after the write thread drains its playback buffer. Check the queue
+    // under its lock so a newly received audio chunk cannot be accidentally unmuted.
+    bool finish_audio_playback() {
+        std::lock_guard<std::mutex> lock(m_audio_queue_mutex);
+        if (!m_audio_queue.empty() || !m_response_audio_done) {
+            return false;
+        }
+        m_interruption_policy.playback_finished();
+        return true;
     }
 
-    bool is_response_audio_done() {
-        return m_response_audio_done;
+    bool is_openai_speaking() {
+        return m_openai_speaking;
     }
 
     void openai_speech_started() {
@@ -595,11 +617,12 @@ class AudioStreamer {
     SpeexResamplerState *m_resampler = nullptr;
     std::queue<std::vector<int16_t>> m_audio_queue;
     std::mutex m_audio_queue_mutex;
-    bool playback_clear_requested = false;
+    std::atomic<bool> playback_clear_requested{false};
     bool m_disable_audiofiles = false; // disable saving audio files if true
-    bool m_openai_speaking = false;
-    bool m_response_audio_done = false;
+    std::atomic<bool> m_openai_speaking{false};
+    std::atomic<bool> m_response_audio_done{false};
     bool m_raw_audio_mode = false;
+    AudioInterruptionPolicy m_interruption_policy;
 };
 
 namespace {
@@ -610,7 +633,7 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
                                  int rtp_packets, const char *extra_headers, bool no_reconnect, const char *tls_cafile,
                                  const char *tls_keyfile, const char *tls_certfile,
                                  bool tls_disable_hostname_validation, bool disable_audiofiles,
-                                 switch_bool_t start_muted, bool raw_audio_mode) {
+                                 switch_bool_t start_muted, bool raw_audio_mode, bool allow_interrupt) {
     int err; // speex
 
     switch_memory_pool_t *pool = switch_core_session_get_pool(session);
@@ -629,6 +652,7 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
     tech_pvt->user_audio_muted = start_muted ? 1 : 0;
     tech_pvt->openai_audio_muted = 0;
     tech_pvt->raw_audio_mode = raw_audio_mode ? 1 : 0;
+    tech_pvt->allow_interrupt = allow_interrupt ? 1 : 0;
 
     const size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
     const size_t playback_buflen = 128000; // 128KB may need to be decreased
@@ -642,7 +666,7 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
     auto *as =
         new AudioStreamer(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat, suppressLog, extra_headers,
                           no_reconnect, tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation,
-                          sampling, playback_sampling, disable_audiofiles, raw_audio_mode);
+                          sampling, playback_sampling, disable_audiofiles, raw_audio_mode, allow_interrupt);
 
     tech_pvt->pAudioStreamer = static_cast<void *>(as);
     tech_pvt->stream_buffers = static_cast<void *>(new StreamBuffers());
@@ -985,6 +1009,12 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
 
     switch_channel_t *channel = switch_core_session_get_channel(session);
 
+    const char *allow_interrupt_var = switch_channel_get_variable(channel, "STREAM_ALLOW_INTERRUPT");
+    const bool allow_interrupt = !allow_interrupt_var || !switch_false(allow_interrupt_var);
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                      "Realtime stream config: STREAM_ALLOW_INTERRUPT=%s, allow_interrupt=%s\n",
+                      allow_interrupt_var ? allow_interrupt_var : "(unset)", allow_interrupt ? "true" : "false");
+
     if (switch_channel_var_true(channel, "STREAM_MESSAGE_DEFLATE")) {
         deflate = 1;
     }
@@ -1070,7 +1100,7 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
                                                   playback_sampling, channels, responseHandler, deflate, heart_beat,
                                                   suppressLog, rtp_packets, extra_headers, no_reconnect, tls_cafile,
                                                   tls_keyfile, tls_certfile, tls_disable_hostname_validation,
-                                                  disable_audiofiles, start_muted, raw_audio_mode)) {
+                                                  disable_audiofiles, start_muted, raw_audio_mode, allow_interrupt)) {
         destroy_tech_pvt(tech_pvt);
         return SWITCH_STATUS_FALSE;
     }
@@ -1251,7 +1281,7 @@ switch_bool_t write_frame(switch_core_session_t *session, switch_media_bug_t *bu
     }
     if (!chunk_enqueued && inuse == 0) {
         // Openai just finished speaking for interruption or end of response
-        if (as->is_openai_speaking() && as->is_response_audio_done()) {
+        if (as->finish_audio_playback() && as->is_openai_speaking()) {
             as->openai_speech_stopped();
         }
         return SWITCH_TRUE;

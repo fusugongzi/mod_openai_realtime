@@ -245,6 +245,7 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
                                           const char *cmd, const stream_api_config_t *api_config) {
     char *mycmd = NULL, *argv[8] = {0};
     int argc = 0;
+    int applied_allow_interrupt = -1;
 
     switch_status_t status = SWITCH_STATUS_FALSE;
 
@@ -359,6 +360,14 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
                 } else {
                     status = start_capture(lsession, flags, wsUri, sampling, playback_sampling, start_muted,
                                            api_config->force_raw_audio_mode);
+                    if (status == SWITCH_STATUS_SUCCESS) {
+                        switch_channel_t *channel = switch_core_session_get_channel(lsession);
+                        switch_media_bug_t *bug = switch_channel_get_private(channel, MY_BUG_NAME);
+                        private_t *tech_pvt = bug ? switch_core_media_bug_get_user_data(bug) : NULL;
+                        if (tech_pvt) {
+                            applied_allow_interrupt = tech_pvt->allow_interrupt ? 1 : 0;
+                        }
+                    }
                 }
                 break;
             }
@@ -383,7 +392,12 @@ static switch_status_t stream_api_execute(switch_stream_handle_t *stream, switch
     }
 
     if (status == SWITCH_STATUS_SUCCESS) {
-        stream->write_function(stream, "+OK Success\n");
+        if (command == STREAM_CMD_START && applied_allow_interrupt >= 0) {
+            stream->write_function(stream, "+OK Success allow_interrupt=%s\n",
+                                   applied_allow_interrupt ? "true" : "false");
+        } else {
+            stream->write_function(stream, "+OK Success\n");
+        }
     } else {
         stream->write_function(stream, "-ERR Operation Failed\n");
     }
